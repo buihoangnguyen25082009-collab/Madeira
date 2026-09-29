@@ -25,30 +25,22 @@ jobs:
       - name: Build Project
         run: |
           PROJ_FILE=$(find . -name "*.xcodeproj" | head -n 1)
-          if [ -n "$PROJ_FILE" ]; then
-            echo "Found project: $PROJ_FILE"
-            # Tự động lấy scheme đầu tiên của dự án
-            SCHEME=$(xcodebuild -project "$PROJ_FILE" -list | sed -n '/Schemes:/,$p' | sed '1d' | head -n 1 | xargs)
-            if [ -z "$SCHEME" ]; then
-              SCHEME="Madeira"
-            fi
-            echo "Building scheme: $SCHEME"
-            
-            xcodebuild -project "$PROJ_FILE" \
-              -scheme "$SCHEME" \
-              -destination 'generic/platform=iOS' \
-              -configuration Release \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              CODE_SIGN_IDENTITY="" \
-              -derivedDataPath build_output \
-              build
-          else
-            echo "No xcodeproj found, attempting cmake build..."
-            mkdir -p build && cd build
-            cmake .. -G Ninja -DCMAKE_SYSTEM_NAME=iOS
-            ninja
+          SCHEME=$(xcodebuild -project "$PROJ_FILE" -list | sed -n '/Schemes:/,$p' | sed '1d' | head -n 1 | xargs)
+          if [ -z "$SCHEME" ]; then
+            SCHEME="Madeira"
           fi
+          echo "Building scheme: $SCHEME"
+          
+          xcodebuild -project "$PROJ_FILE" \
+            -scheme "$SCHEME" \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="-" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            -derivedDataPath build_output \
+            clean build
 
       - name: Package into IPA
         run: |
