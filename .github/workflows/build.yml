@@ -1,0 +1,60 @@
+name: Build Madeira IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-14
+    steps:
+      - name: Checkout code with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install build tools
+        run: |
+          brew install cmake ninja lld
+
+      - name: Select latest Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build Project
+        run: |
+          PROJ_FILE=$(find . -name "*.xcodeproj" | head -n 1)
+          if [ -n "$PROJ_FILE" ]; then
+            xcodebuild -project "$PROJ_FILE" -alltargets \
+              -destination 'generic/platform=iOS' \
+              -configuration Release \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              build -derivedDataPath build_output
+          else
+            echo "No xcodeproj found, attempting cmake build..."
+            mkdir -p build && cd build
+            cmake .. -G Ninja -DCMAKE_SYSTEM_NAME=iOS
+            ninja
+          fi
+
+      - name: Package into IPA
+        run: |
+          mkdir -p Payload
+          APP_DIR=$(find build_output/Build/Products/Release-iphoneos -name "*.app" -type d | head -n 1)
+          if [ -n "$APP_DIR" ]; then
+            cp -R "$APP_DIR" Payload/
+            zip -r Madeira.ipa Payload
+          else
+            echo "Error: .app file not found"
+            exit 1
+          fi
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-Release-IPA
+          path: Madeira.ipa
+          retention-days: 7
