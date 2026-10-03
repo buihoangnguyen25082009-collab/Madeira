@@ -7,10 +7,11 @@ jobs:
   build-ios:
     runs-on: macos-14
     steps:
-      - name: Checkout code with submodules
+      - name: Checkout code with submodules & LFS
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          lfs: true
           fetch-depth: 1
 
       - name: Install build tools
@@ -22,12 +23,8 @@ jobs:
         with:
           xcode-version: latest-stable
 
-      - name: Patch out dylib signing
+      - name: Strip Signing Build Phases
         run: |
-          # 1. Vo hieu hoa codesign trong tat ca file script .sh va .py
-          find . -type f \( -name "*.sh" -o -name "*.py" \) -exec sed -i '' 's/codesign/true/g' {} + || true
-
-          # 2. Thay the truc tiep moi lenh codesign trong file cau hinh Xcode
           python3 -c '
           import glob, re
 
@@ -35,14 +32,22 @@ jobs:
               with open(pbx, "r", encoding="utf-8") as f:
                   content = f.read()
 
-              # Thay the moi cu phap codesign thanh /usr/bin/true
+              # Vo hieu hoa moi script phase chua tu khoa codesign hoac Sign bundled dylibs
+              def neutralize_script(match):
+                  body = match.group(0)
+                  if "Sign bundled dylibs" in body or "codesign" in body:
+                      print(f"Neutralized phase in {pbx}")
+                      body = re.sub(r"shellScript\s*=\s*\"[\s\S]*?\";", "shellScript = \"exit 0\\n\";", body)
+                  return body
+
+              content = re.sub(r"[0-9A-Fa-f]{24}\s*/\*[^*]*\*/\s*=\s*\{[\s\S]*?isa\s*=\s*PBXShellScriptBuildPhase;[\s\S]*?\};", neutralize_script, content)
+              
+              # Thay the truc tiep moi lenh codesign con sot lai thanh /usr/bin/true
               content = content.replace("/usr/bin/codesign", "/usr/bin/true")
-              content = content.replace("codesign ", "/usr/bin/true ")
-              content = content.replace("\"codesign\"", "\"/usr/bin/true\"")
+              content = re.sub(r"\bcodesign\b", "/usr/bin/true", content)
 
               with open(pbx, "w", encoding="utf-8") as f:
                   f.write(content)
-              print(f"Patched {pbx}")
           '
 
       - name: Build Project
@@ -54,6 +59,8 @@ jobs:
           fi
           echo "Building scheme: $SCHEME"
           
+          # Chay xcodebuild va ghi log de bat loi neu build that bai
+          set -o pipefail
           xcodebuild -project "$PROJ_FILE" \
             -scheme "$SCHEME" \
             -destination 'generic/platform=iOS' \
@@ -62,7 +69,12 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             -derivedDataPath build_output \
-            clean build
+            build 2>&1 | tee xcodebuild.log || {
+              echo "==================== XCODE ERROR DETAILS ===================="
+              grep -E -i -C 2 "error:|fatal error:|PhaseScriptExecution.*failed" xcodebuild.log | tail -n 40
+              echo "============================================================="
+              exit 1
+            }
 
       - name: Package into IPA
         run: |
