@@ -31,7 +31,7 @@ import ObjectiveC
 // keys extended, and the wineserver synthesises the generic VK_SHIFT/
 // VK_CONTROL/VK_MENU from the left/right ones. Posting VK_LSHIFT is therefore
 // both more precise than VK_SHIFT and fully compatible.
-// build/host-tests/check-hardware-input.py checks the combined HID -> VK ->
+// tests/host/check-hardware-input.py checks the combined HID -> VK ->
 // scan code result against Wine's US layout.
 //
 // FOCUS: GCKeyboard and GCMouse report to the app whatever the user is doing
@@ -531,9 +531,12 @@ final class HardwareInput: ObservableObject {
         return v.pointee == 49  // '1'
     }
 
-    private static func envInt(_ name: String, _ def: Int) -> Int {
-        guard let v = getenv(name), let i = Int(String(cString: v)) else { return def }
-        return i
+    /// The desktop's live size in guest pixels (IOSDisplayShim): the session
+    /// default until a program changes the display mode, which resizes it.
+    private static func desktopSize() -> (w: Int, h: Int) {
+        var w: Int32 = 0, h: Int32 = 0
+        winios_screen_size(&w, &h)
+        return (w > 0 ? Int(w) : 1024, h > 0 ? Int(h) : 768)
     }
 
     /// A program on the game view, with its cursor drawn by this file.
@@ -1101,9 +1104,9 @@ final class HardwareInput: ObservableObject {
     private func followDesktopCursor(_ dx: Int32, _ dy: Int32, sync: Bool) {
         DispatchQueue.main.async {
             let cur = MetalBackedView.cursor
+            let desk = Self.desktopSize()
             let p = DesktopCursor.advance(x: Double(cur.x), y: Double(cur.y), dx: dx, dy: dy,
-                                          width: Self.envInt("MADEIRA_SCREEN_W", 1024),
-                                          height: Self.envInt("MADEIRA_SCREEN_H", 768))
+                                          width: desk.w, height: desk.h)
             MetalBackedView.cursor = CGPoint(x: p.x, y: p.y)
             if sync {
                 // Also draws the arrow (winios_pointer draws absolute moves).
@@ -1118,8 +1121,9 @@ final class HardwareInput: ObservableObject {
     /// the game view. Main thread.
     private func postAbsolute(_ p: CGPoint, in view: UIView) {
         let desktop = Self.desktopMode
-        let sw = desktop ? Self.envInt("MADEIRA_SCREEN_W", 1024) : DirectCursorOverlay.screenW
-        let sh = desktop ? Self.envInt("MADEIRA_SCREEN_H", 768) : DirectCursorOverlay.screenH
+        let desk = Self.desktopSize()
+        let sw = desktop ? desk.w : DirectCursorOverlay.screenW
+        let sh = desktop ? desk.h : DirectCursorOverlay.screenH
         let s = ScreenMap.toScreen(x: Double(p.x), y: Double(p.y), viewW: Double(view.bounds.width),
                                    viewH: Double(view.bounds.height), screenW: sw, screenH: sh)
         setMouseInUse(true)
@@ -2013,7 +2017,9 @@ final class PadStickMouse: ObservableObject {
     }
 
     @objc private func tick(_ l: CADisplayLink) {
-        guard let p = profile, HardwareInput.shared.baseFocused else { return }
+        // Keyboard-and-mouse controller mode (PadKeyboardMouse) owns the stick:
+        // moving the mouse here as well would double it.
+        guard let p = profile, HardwareInput.shared.baseFocused, !GamepadInput.shared.keyboardMouseOn else { return }
         let f = StickVelocity.frame(x: Double(p.rightThumbstick.xAxis.value),
                                     y: Double(p.rightThumbstick.yAxis.value),
                                     gain: InputSettings.shared.sensRel,

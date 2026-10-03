@@ -40,7 +40,7 @@ struct DockGame: Identifiable, Equatable, Sendable {
     }
 }
 
-/// Madeira Dock: a small headless host (research/madeira-dock, built by
+/// Madeira Dock: a small headless host (madeira-dock, built by
 /// build/madeira-dock/build.sh into arm64ec-windows/dockhost.exe) that loads
 /// Valve's genuine Windows Steam client inside the Wine session, signs in
 /// with the user's own refresh token and asks the client to start an
@@ -206,6 +206,13 @@ enum MadeiraDock {
                 }
                 return "Madeira Dock could not initialize the Steam session (code 30). Export the log to identify the failed check."
             }
+            // The host waits 90 s after sign-in for Valve's client to count the game
+            // among the account's subscriptions (madeira-dock src/session.c).
+            if result == 34 {
+                return fields["session-authenticated-online"] == "1"
+                    ? "Steam signed in but did not confirm this game's license in time. Export the log before trying again."
+                    : "Steam did not finish signing in. Check the connection and try again."
+            }
             if result == 35 { return "Steam did not confirm a license for this game on the signed-in account." }
             if result == 37 {
                 if fields["session-native-handoff-app-mismatch"] == "1" {
@@ -253,6 +260,8 @@ enum MadeiraDock {
                     : "Steam needs to install or update content this game depends on before it can start. Start the game again to let Madeira Dock wait for Steam."
             case 18: return "Steam does not see this game as installed."
             case 28: return "Steam could not find the game's executable."
+            // Steam's CreateProcess for the game failed: Madeira could not load the program.
+            case 29: return "Steam started this game's program, but Madeira could not load it (Steam reports an invalid platform). Export the log: it names the reason."
             case 22, 23, 24: return "Steam could not read this game's configuration. Try again."
             case 25: return "Steam says this game is not released yet."
             case 26: return "Steam says this game is not available in your region."
@@ -269,14 +278,18 @@ enum MadeiraDock {
         "session-native-handoff-app-mismatch", "session-handoff-stage", "session-handoff-error",
         "session-account-input-invalid", "session-app-input-invalid",
         "session-native-token-submitted", "session-logon-start-result", "session-connection-result",
-        "session-authenticated-online", "session-requested-app-listed", "session-auth-test-result",
+        "session-authenticated-online", "session-requested-app-entitled", "session-subscription-count",
+        "session-requested-app-listed", "session-auth-test-result",
+        "session-online-subscription-count", "session-online-app-zero-query", "session-online-callback-id",
+        "session-timeout-subscription-count", "session-timeout-app-listed", "session-timeout-still-online",
+        "session-online-blip", "session-online-blips", "session-online-lost", "session-entitlement-source",
         "launch-client-error", "launch-update-wait", "launch-update-retry", "launch-update-ready",
         "launch-config-wait", "launch-config-gave-up", "launch-session-wait", "launch-session-gave-up",
         "ceg-request", "ceg-request-result", "ceg-request-busy", "ceg-server-result", "ceg-job-result",
         "ceg-finished-jobs", "ceg-result", "ceg-disabled", "ceg-unsupported-client",
         "ceg-scm", "ceg-scm-started", "ceg-scm-error", "ceg-service-registered", "ceg-service-install", "ceg-service-stop", "ceg-scm-stopped",
         "shutdown-begin", "shutdown-complete", "probe-result"]
-    /// The host's report rounds (research/madeira-dock src/main.c).
+    /// The host's report rounds (madeira-dock src/main.c).
     static let reportRounds: Set<String> = ["ml1820", "ml1830", "ml1860", "ml1870", "ml1970", "ml1990", "ml2000", "ml2011", "ml2015"]
 
     static func parseReport(_ data: Data) -> Report {
@@ -293,6 +306,13 @@ enum MadeiraDock {
             if key == "client-sha256", value.utf8.count == 64,
                value.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) {
                 report.fields[key] = value
+            } else if key == "session-callback-id", let number = Int32(value) {
+                // Valve's callback IDs after sign-in (the host reports the first 16), in
+                // order, as one field: the poll logs a field only when it changes.
+                let ids = report.fields["session-callback-ids"]
+                if (ids?.split(separator: ",").count ?? 0) < 16 {
+                    report.fields["session-callback-ids"] = (ids.map { $0 + "," } ?? "") + String(number)
+                }
             } else if reportAllowed.contains(key), let number = Int32(value) {
                 report.fields[key] = String(number)
             }
@@ -311,6 +331,14 @@ enum MadeiraDock {
         let report = parseReport(data)
         for key in report.fields.keys.sorted() where report.fields[key] != lastReport.fields[key] {
             SteamLog.event("[dock-report] \(key)=\(report.fields[key]!)")
+        }
+        // The host ended: its whole report, in order, so the sequence and repeats of
+        // its numeric fields are in the diagnostic log (each line is `[steam-host]
+        // <round> <field>=<number>`; nothing else is in the file).
+        if report.fields["probe-result"] != nil, lastReport.fields["probe-result"] == nil {
+            let lines = String(decoding: data, as: UTF8.self).split(separator: "\n").filter { $0.hasPrefix("[steam-host] ") }
+            SteamLog.event("[dock-report-file] lines=\(lines.count)")
+            for line in lines.prefix(400) { SteamLog.event("[dock-report-file] " + line.trimmingCharacters(in: .whitespacesAndNewlines)) }
         }
         lastReport = report
         return report
@@ -388,6 +416,16 @@ enum MadeiraDock {
         let retire = SteamSignIn.flag("MADEIRA_DOCK_IMAGE_RETIRE", default: true)
         if retire { setenv("MADEIRA_JIT_IMAGE_RETIRE", "1", 1) }
         SteamLog.event("[dock-launch] image-retire=\(retire ? 1 : 0)")
+        // While the loader loads Valve's client and its many imports, the emulator's
+        // image-map handler can commit a page of its own heap under its interval lock; the
+        // commit's notification then waits for that same lock and the host parks for good
+        // (no report after load-client-begin). Wine's opt-in MADEIRA_IMAGE_MAP_GUARD (off for
+        // every other session) keeps the emulator's own memory calls un-notified there, as
+        // on the syscall path. Dock sessions turn it on; ntdll without the switch ignores it.
+        // env.MADEIRA_DOCK_IMAGE_MAP_GUARD = 0 leaves it off.
+        let guardMap = SteamSignIn.flag("MADEIRA_DOCK_IMAGE_MAP_GUARD", default: true)
+        if guardMap { setenv("MADEIRA_IMAGE_MAP_GUARD", "1", 1) }
+        SteamLog.event("[dock-launch] image-map-guard=\(guardMap ? 1 : 0)")
     }
 
     /// Wine's explorer opens a virtual desktop and starts the host in it. With

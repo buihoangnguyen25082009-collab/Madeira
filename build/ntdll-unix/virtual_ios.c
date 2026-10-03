@@ -4398,6 +4398,11 @@ static uint32_t ios_insn_replace_x18(uint32_t insn, int role, int scratch)
  * ios_jit_patch_x18. Shared by the patcher and the trampoline-need
  * counter. Caller frees. NULL on alloc failure (callers degrade to the
  * unguarded pre-2026-07-07 behavior). */
+/* One BIT per 4-byte instruction word; see ios_x18_build_data_map. Every reader
+ * must use this -- an open-coded index is how the teb-tsd retarget pass read past
+ * the end of the allocation. `off` is a BYTE offset into .text. */
+#define IOS_X18_DATA_WORD(dm, off)     ((dm)[(((size_t)(off)) / 4) >> 3] & (1 << ((((size_t)(off)) / 4) & 7)))
+
 static unsigned char *ios_x18_build_data_map( const char *text, size_t text_size )
 {
     unsigned char *data_map = calloc( 1, text_size / 32 + 1 );
@@ -4508,6 +4513,31 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
      * The triplet is matched in full and all three registers must agree, so a
      * stray LDR with a coincidental immediate cannot be hit. Literal-pool
      * words are excluded via data_map for the same reason as the x18 pass. */
+    /* The "offset not discovered yet" case is FATAL-BY-SILENCE and must not stay
+     * quiet. If an image carrying the triplet is patched before the TSD slot is
+     * known, the pass is skipped, the PLACEHOLDER immediate survives, and every
+     * TEB read in that image returns whatever pthread keeps in slot 0x898 -- a
+     * wrong pointer used as the TEB, with no fault to catch it. The ordering is
+     * sound today (the slot is published during early ntdll-unix init, long
+     * before any PE is copied), so this is insurance, not a known path. */
+    if (!ios_teb_tls_slot_offset && text_size >= 12)
+    {
+        for (size_t i = 0; i + 12 <= text_size; i += 4)
+        {
+            uint32_t i0 = *(uint32_t *)(text_rw + i);
+            unsigned reg = i0 & 0x1f;
+            if ((i0 & 0xffffffe0) != 0xd53bd060) continue;
+            if (*(uint32_t *)(text_rw + i + 4) != (0x927df000u | (reg << 5) | reg)) continue;
+            if ((*(uint32_t *)(text_rw + i + 8) & 0xffc003ff) != (0xf9400000u | (reg << 5) | reg))
+                continue;
+            dprintf(2, "[teb-tsd] FATAL-BY-SILENCE: .text %p contains a hand-written TSD read at +0x%lx but the "
+                       "slot offset is NOT KNOWN YET -- the placeholder immediate will survive and "
+                       "this image will read a stranger's TSD word as its TEB\n",
+                    text_rx, (unsigned long)i);
+            break;
+        }
+    }
+
     if (ios_teb_tls_slot_offset && text_size >= 12)
     {
         const uint32_t want_imm = (uint32_t)(ios_teb_tls_slot_offset / 8) << 10;
@@ -4529,7 +4559,22 @@ int ios_jit_patch_x18(char *text_rw, char *text_rx, size_t text_size,
             uint32_t i0, i1, i2;
             unsigned reg;
 
-            if (data_map && (data_map[i / 4] || data_map[(i + 4) / 4] || data_map[(i + 8) / 4]))
+            /* This read used to be `data_map[i / 4]`, one BYTE per instruction
+             * word. ios_x18_build_data_map allocates `text_size / 32 + 1` bytes
+             * and stores ONE BIT per word -- the x18 pass below reads it as
+             * `dm[(i/4) >> 3] & (1 << ((i/4) & 7))`. The byte form was wrong
+             * twice over: it read out of bounds from the eighth of .text onwards
+             * (for a 2 MB .text, ~512 KB past the end of a 132 KB allocation),
+             * and whatever heap byte it found there made the triplet look like
+             * a literal pool and be SKIPPED. Whether a given build of the CPU
+             * module was patched therefore depended on where its linker put the
+             * triplets: one build's sat inside the first eighth and worked, the
+             * next build's sat past it, kept the placeholder slot, read a
+             * stranger's TSD word as the TEB and faulted at 0x1788 on the first
+             * transition into the emulator. */
+            if (data_map && (IOS_X18_DATA_WORD( data_map, i ) ||
+                             IOS_X18_DATA_WORD( data_map, i + 4 ) ||
+                             IOS_X18_DATA_WORD( data_map, i + 8 )))
                 continue;
 
             i0 = *(uint32_t *)(text_rw + i);
@@ -6448,6 +6493,33 @@ static void ios_exe_win_init( void )
              (unsigned long long)(ios_exe_win_base + ios_exe_win_size) );
 }
 
+/* The image map_image_view is placing right now has its relocations stripped
+ * (IMAGE_FILE_RELOCS_STRIPPED): it runs at its ImageBase or not at all.  Set
+ * and cleared by map_image_view around its preferred-base attempt, under
+ * virtual_mutex.
+ *
+ * The 64 MB floor below assumes that a small image at the default ImageBase is
+ * relocatable, so it keeps the window for a later large fixed-base image.  A
+ * small image with stripped relocations is refused by that floor, placed
+ * elsewhere, and the loader then fails it with STATUS_CONFLICTING_ADDRESSES
+ * ("failed to create main module ... c0000018"): the program can never start.
+ * Such an image now gets the window whatever its size. */
+static int ios_exe_win_stripped_request;
+
+static int ios_exe_win_small_fixed(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        /* 0 keeps the executable window from a fixed-base (relocations stripped) image smaller
+         * than 64 MB, as before; such a program then fails to start. */
+        const char *e = getenv( "MADEIRA_EXE_WINDOW_SMALL_FIXED" );
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled;
+}
+
 /* Returns 1 if the reservation was released for this request. */
 static int ios_exe_win_claim( const void *addr, size_t size )
 {
@@ -6458,7 +6530,16 @@ static int ios_exe_win_claim( const void *addr, size_t size )
      * a released window still has to answer a matching request. */
     if (!ios_exe_win_base) return 0;
     if (a < ios_exe_win_base || a + size > ios_exe_win_base + ios_exe_win_size) return 0;
-    if (size < 64u * 1024u * 1024u)
+    if (size < 64u * 1024u * 1024u && ios_exe_win_stripped_request && ios_exe_win_small_fixed())
+    {
+        static int fixed_n;
+        if (fixed_n++ < 8)
+            dprintf( 2, "[exe-window] %p+%#lx is under the 64MB floor but its relocations are "
+                     "stripped: it can only run at this base, so it gets the window "
+                     "(MADEIRA_EXE_WINDOW_SMALL_FIXED=0 refuses it as before)\n",
+                     addr, (unsigned long)size );
+    }
+    else if (size < 64u * 1024u * 1024u)
     {
         static int small_n;
         if (small_n++ < 8)
@@ -7398,7 +7479,7 @@ static void ios_wow_exclude_windows( void **start, void **end )
     }
 }
 
-/* ---- lazy-window policy (build/host-tests/check-lazy-windows.py compiles this) ---- */
+/* ---- lazy-window policy (tests/host/check-lazy-windows.py compiles this) ---- */
 
 /* The kernel's end of the user address map (TASK_VM_INFO.max_address), or 0
  * when the kernel does not say. */
@@ -7819,6 +7900,50 @@ static ULONG_PTR ios_wow_extend_holdback_tail( unsigned *guard_owned )
     return ios_wow_window_try( base, guard_owned ) ? base : 0;
 }
 
+/* Give the unclaimed [cage] holdback to Wine's allocator when the band is
+ * exhausted.
+ *
+ * The holdback is 8 GB of a ~15 GB furniture window. A session with no
+ * Chromium never claims it, and a guest that reserves address space freely can
+ * fill the rest, so that even a 1 MB request fails. Handing the holdback over
+ * then costs nothing the session was going to use.
+ *
+ * Only for a failed request whose search range [start, end) could be served
+ * from the holdback: anything else gains nothing from it, and the holdback
+ * stays whole for the cage grant and the guest-window carve.
+ *
+ * WHAT IS HANDED OVER. The holdback becomes a Wine reserved area, as a guest
+ * window is: the VA stays mapped PROT_NONE and ours, and map_reserved_area
+ * places views in it. No munmap, so the kernel never sees a hole another
+ * mapping could take. Its first host page is kept out: a guest window at
+ * 0x7100000000 that found only an exact 4 GB gap borrowed its overrun guard
+ * from it (ios_wow_window_try), and that page must stay inaccessible.
+ * ios_cage_holdback_live is cleared, which disables the cage grant (it munmaps
+ * the whole range) and the carve.
+ *
+ * Off unless MADEIRA_CAGE_RELEASE=1, which the app sets for a Madeira Dock
+ * session (headless Steam client, no CEF). Called with virtual_mutex held.
+ * Returns 1 if the holdback was handed over. */
+static int ios_cage_release_on_exhaustion( void *start, void *end, size_t want )
+{
+    /* 1: when the guest band is exhausted, hand the unclaimed 8 GB V8 cage
+     * holdback to it. Set by the app for a Madeira Dock session; off otherwise. */
+    const char *e = getenv( "MADEIRA_CAGE_RELEASE" );
+    const ULONG_PTR lo = IOS_CAGE_BASE + ios_wow_guard_size();
+    const ULONG_PTR hi = IOS_CAGE_BASE + IOS_CAGE_REAL_SIZE;
+    ULONG_PTR s = (ULONG_PTR)start > lo ? (ULONG_PTR)start : lo;
+    ULONG_PTR t = (ULONG_PTR)end < hi ? (ULONG_PTR)end : hi;
+
+    if (!ios_cage_holdback_live || !e || *e != '1') return 0;
+    if (t <= s || t - s < want) return 0;
+    mmap_add_reserved_area( (void *)lo, hi - lo );
+    ios_cage_holdback_live = 0;
+    dprintf( 2, "[cage] holdback handed to the allocator [%p,%p): the band is exhausted "
+                "(request 0x%lx) and no V8 cage was asked for; its first page stays a guard\n",
+             (void *)lo, (void *)hi, (unsigned long)want );
+    return 1;
+}
+
 static ULONG_PTR ios_wow_window_pick( unsigned *guard_owned )
 {
     ULONG_PTR floor, ceil;
@@ -7947,7 +8072,7 @@ static int ios_wow_window_teardown( ULONG_PTR base, void *dead_peb, unsigned gua
  * the interval has long passed and nothing sleeps. */
 #define IOS_WOW_SETTLE_SEC 3
 
-/* The native D3D9 frontend's per-process teardown (research/dxmt,
+/* The native D3D9 frontend's per-process teardown (dxmt,
  * src/d3d9/unix/d3d9_native_glue.cpp, linked through libdxmt_combined.a).
  * Native D3D9 objects, and the Metal objects behind them, hold host pointers
  * into the dead process's window; they have to be dropped before the window
@@ -8436,6 +8561,13 @@ extern const void *crypt32_unix_call_funcs[];
  * when \\.\Nsi can't be opened. See nsi_unixlib_ios.c */
 extern const void *nsi_unix_call_funcs[];
 
+/* dnsapi's unix side (the system resolver), compiled from upstream
+ * dlls/dnsapi/libresolv.c by build/ntdll-unix/dnsapi_unixlib_ios.c. Without it
+ * dnsapi.dll got the generic stub table below, so DnsQuery_* and the DNS
+ * server list that iphlpapi's GetAdaptersAddresses asks for failed with
+ * STATUS_NOT_SUPPORTED, and so did GetAdaptersAddresses itself. */
+extern const void *dnsapi_unix_call_funcs[];
+
 /* iOS-Madeira ml494 (#61 text wall): dwrite's unix side (freetype glyph
  * rasterisation). Without it every __wine_unix_call from dwrite.dll failed,
  * so get_glyph_bbox never ran and every glyph run reported an EMPTY bbox —
@@ -8482,7 +8614,8 @@ extern const void *crypt32_unix_call_wow64_funcs[];
 extern const void *dwrite_unix_call_wow64_funcs[];
 extern const void *audio_null_ios_unix_call_wow64_funcs[];
 extern const void *nsi_unix_call_wow64_funcs[];
-/* The native D3D9 frontend's table for the i386 d3d9shim.dll (research/dxmt,
+extern const void *dnsapi_unix_call_wow64_funcs[];
+/* The native D3D9 frontend's table for the i386 d3d9shim.dll (dxmt,
  * generated by src/d3d9shim/gen_d3d9_thunks.py into d3d9_unix_table.c). */
 extern const void *const dxmt_d3d9_unix_call_wow64_funcs[];
 /* winegstreamer's is written by hand in winegstreamer_unixlib_ios.c, because
@@ -8502,6 +8635,14 @@ static BOOL ios_wg_64bit_opted_in(void)
 {
     const char *e = getenv( "MADEIRA_WG_64BIT" );
     return e && e[0] == '1';
+}
+
+/* dnsapi's unix side is bound unless MADEIRA_DNSAPI_UNIXLIB=0, which keeps the
+ * stub table (every dnsapi unix call STATUS_NOT_SUPPORTED) as before. */
+static BOOL ios_dnsapi_unixlib_enabled(void)
+{
+    const char *e = getenv( "MADEIRA_DNSAPI_UNIXLIB" );
+    return !(e && e[0] == '0');
 }
 
 /***********************************************************************
@@ -8774,6 +8915,11 @@ static NTSTATUS load_builtin_unixlib( void *module, BOOL wow, const void **funcs
             libname = "nsi (rev=ml472)";
             funcs64 = (const void *)nsi_unix_call_funcs;
             funcs_wow64 = (const void *)nsi_unix_call_wow64_funcs;
+        } else if (match && (strstr(match, "dnsapi") || strstr(match, "DNSAPI")) && ios_dnsapi_unixlib_enabled()) {
+            /* "dnsapi" matches the export name and a unix_path of "dnsapi.so". */
+            libname = "dnsapi (libresolv)";
+            funcs64 = (const void *)dnsapi_unix_call_funcs;
+            funcs_wow64 = (const void *)dnsapi_unix_call_wow64_funcs;
         } else if (match && strstr(match, "win32u")) {
             /* Register win32u's NtUser / NtGdi syscall table in slot 1.
              * Activating this causes user32 process_attach to crash until
@@ -11085,10 +11231,11 @@ volatile int ios_in_mach_exc;
  * host meaning, while VPROT_WRITE is load-bearing -- it is what makes an inline
  * hook, a runtime relocation fixup, or the emulator's own SMC untrap land.
  *
- * Deliberately NOT "anything in the window": a guest that allocates anonymous
- * RWX memory (a managed runtime's code buffers) still needs the pool alias and
- * the store emulator, and those views are not SEC_IMAGE.  The test is the view,
- * not the address range.
+ * Deliberately NOT "anything in the window": a guest's anonymous executable
+ * memory is decided by its own rule (ios_guest_anon_rwx_is_host_data, below):
+ * a managed runtime's code buffers keep the pool alias and the store emulator,
+ * and those views are not SEC_IMAGE.  The test is the view, not the address
+ * range.
  *
  * virtual_mutex is held by every caller that can reach here (mprotect_range from
  * set_vprot, and the map_image section loop), so find_view() is safe. */
@@ -11114,6 +11261,93 @@ static int ios_guest_image_is_host_data( const void *base, size_t size )
     if (!ios_wow_in_window( base )) return 0;
     if (!(view = find_view( base, size ))) return 0;
     return (view->protect & SEC_IMAGE) != 0;
+#else
+    return 0;
+#endif
+}
+
+
+/* A guest's anonymous RWX data heap is plain read/write memory to the host.
+ *
+ * Some runtimes allocate their data heap PAGE_EXECUTE_READWRITE (Mono's Boehm
+ * GC does). mprotect_exec cannot grant host exec, so it would back the heap
+ * with a JIT-pool R+X slot and route every store through the store emulator.
+ * Host exec is not needed: x86 bytes are decoded by FEX, never fetched by the
+ * host, and FEX tracks SMC on RWX ranges itself through NtProtectVirtualMemory
+ * (see ml1030). So PROT_EXEC is dropped for such a heap.
+ *
+ * Excluded, because they need (or already have) the pool path: EC_CODE requests
+ * (ios_alloc_ec_code while the request is in flight, VPROT_ARM64EC afterwards),
+ * the JIT pool, alias-backed ranges, images, file mappings, and views under
+ * 64 KB (possible native thunk pages).
+ *
+ * Guest JIT code chunks are excluded too: guests patch them with unaligned
+ * atomics, which must not land on a plain page FEX has armed for SMC. Two tests
+ * keep them out. Only a view ALLOCATED read-write-execute qualifies (its
+ * allocation protection, view->protect, has both VPROT_WRITE and VPROT_EXEC),
+ * as a GC heap is: a JIT that allocates read-write and makes its code
+ * executable later keeps the pool path. And code and data are told apart by
+ * size, a heuristic: Boehm's heap chunks are an expansion plus one 4 KB page
+ * (0x41000, ...), never a multiple of 64 KB, while Mono's code chunks, also
+ * allocated RWX, are (0x100000). A data heap sized in 64 KB multiples just
+ * keeps the pool path.
+ *
+ * The decision is per allocation and permanent. A page must not move to the
+ * pool later: that copies and remaps a live page, and a store landing between
+ * the two is lost.
+ *
+ * MADEIRA_GUEST_RWX_DATA=0 restores the previous behaviour. */
+static int ios_alloc_ec_code;   /* set by allocate_virtual_memory under virtual_mutex */
+
+static int ios_guest_rwx_data_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        /* On by default: a guest's anonymous RWX data heap (Mono's Boehm GC) is
+         * plain read/write memory. 0 maps it through the JIT pool again, with
+         * every store emulated, as before. */
+        const char *s = getenv( "MADEIRA_GUEST_RWX_DATA" );
+        cached = (s && (*s == '0' || *s == 'n' || *s == 'N')) ? 0 : 1;
+    }
+    return cached;
+}
+
+static int ios_guest_anon_rwx_view_ok( const struct file_view *view )
+{
+    if (!is_view_valloc( view )) return 0;
+    if (view->protect & (SEC_IMAGE | VPROT_ARM64EC | VPROT_SYSTEM)) return 0;
+    /* allocated RWX, not made executable after the fact: see above */
+    if ((view->protect & (VPROT_WRITE | VPROT_EXEC)) != (VPROT_WRITE | VPROT_EXEC)) return 0;
+    if (view->size < 0x10000) return 0;
+    return (view->size & 0xffff) != 0;   /* data, not a code chunk: see above */
+}
+
+/* The range is host-page rounded (16 KB) and can run past the end of a guest
+ * allocation (0x41000 -> 0x44000), so every view it touches must qualify. */
+static int ios_guest_anon_rwx_is_host_data( const void *base, size_t size )
+{
+#ifdef WINE_IOS
+    extern int ios_jit_anon_alias_find_cover(void *, size_t, void **, void **);
+    extern void *ios_jit_rx_base_global;
+    extern size_t ios_jit_pool_size_global;
+    void *cov_rw = NULL, *cov_rx = NULL;
+    uintptr_t b = (uintptr_t)base, e = b + size, a, rx = (uintptr_t)ios_jit_rx_base_global;
+    int any = 0;
+
+    if (!ios_guest_rwx_data_enabled() || ios_alloc_ec_code || !arm64ec_view) return 0;
+    if (e <= b) return 0;
+    if (rx && e > rx && b < rx + ios_jit_pool_size_global) return 0;
+    if (ios_jit_anon_alias_find_cover( (void *)base, size, &cov_rw, &cov_rx )) return 0;
+    for (a = b; a < e; )
+    {
+        struct file_view *view = find_view( (const void *)a, 1 );
+        if (!view) { a = (a + 0x1000) & ~(uintptr_t)0xfff; continue; }   /* rounding gap */
+        if (!ios_guest_anon_rwx_view_ok( view )) return 0;
+        any = 1;
+        a = (uintptr_t)view->base + view->size;
+    }
+    return any;
 #else
     return 0;
 #endif
@@ -11173,6 +11407,21 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
         unix_prot &= ~PROT_EXEC;
         if (!unix_prot) unix_prot = PROT_READ;   /* PAGE_EXECUTE alone: readable is the honest answer */
     }
+    else if ((unix_prot & PROT_EXEC) && ios_guest_anon_rwx_is_host_data( base, size ))
+    {
+        static unsigned long grd_n;
+        if (++grd_n <= 24 && !ios_in_mach_exc)
+            dprintf( 2, "[guest-rwx] #%lu %p+0x%lx prot=%c%c%c — anonymous guest memory, "
+                        "EXEC is FEX bookkeeping; applying %c%c- instead\n",
+                     grd_n, base, (unsigned long)size,
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-',
+                     (unix_prot & PROT_EXEC)  ? 'x' : '-',
+                     (unix_prot & PROT_READ)  ? 'r' : '-',
+                     (unix_prot & PROT_WRITE) ? 'w' : '-' );
+        unix_prot &= ~PROT_EXEC;
+        if (!unix_prot) unix_prot = PROT_READ;
+    }
 
 #endif
 
@@ -11224,8 +11473,34 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
          * never executed from its own pages (it is translated into the JIT
          * pool), so apply the protection the caller asked for instead of
          * failing every PAGE_READONLY request with STATUS_ACCESS_DENIED.
-         * Outside a window this is the upstream rule. */
-        if (!(unix_prot & PROT_WRITE) && !ios_wow_in_window( base )) return -1;
+         *
+         * The same holds OUTSIDE the windows, where this used to keep the
+         * upstream rule. A 32-bit process also runs 64-bit host images there
+         * (wow64.dll, the emulator DLL, ntdll), and force_exec_prot is one flag
+         * for the whole host process: once a 32-bit process has turned it on,
+         * every later process sees it, 64-bit ones included. The loader makes
+         * an import table writable, fills it, and puts PAGE_READONLY back; that
+         * last request failed, and NtProtectVirtualMemory syncs an image's
+         * JIT-pool copy only when the protection change succeeds, so the copy
+         * that runs kept the unresolved table. wow64.dll then called its first
+         * import through an entry that still held a name offset and every
+         * 32-bit program died with an access violation at start; a 64-bit
+         * program started after it died the same way. Nothing is gained by the
+         * refusal: no page outside the JIT pool can be executable here.
+         *
+         * Only a 32-bit (WoW64) process can switch force_exec_prot on
+         * (NtSetInformationProcess(ProcessExecuteFlags) refuses a 64-bit
+         * process), so a run that never starts a 32-bit program never reaches
+         * this line. */
+        if (!(unix_prot & PROT_WRITE))
+        {
+            static unsigned int unforced_n;
+
+            if (++unforced_n <= 4 && !ios_in_mach_exc)
+                dprintf( 2, "[force-exec] PROT_EXEC unavailable; applying the requested protection "
+                            "unforced at %p+0x%lx (%s a guest window)\n", base, (unsigned long)size,
+                         ios_wow_in_window( base ) ? "inside" : "outside" );
+        }
 #else
         if (!(unix_prot & PROT_WRITE)) return -1;
 #endif
@@ -13163,7 +13438,66 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
     seq = hi ? ++ck_hi : ++ck_lo;
     {
         size_t chk = size < 64 ? (size_t)size : 64;
-        long nz = ios_first_nonzero( base, chk );
+        unsigned char snap[64];
+        mach_vm_size_t got = 0;
+        long nz;
+
+        /* ml981: THIS PROBE RUNS UNDER virtual_mutex, SO IT MAY NEVER FAULT.
+         *
+         * The ml293 comment above claims the probe "can never itself fault"
+         * because it checks the protection first — but it checks the protection
+         * the CALLER ASKED FOR, not the one the page ended up with. When a
+         * commit reports success while the host page stays PROT_NONE (device
+         * logs t85:1195 / t86:5280, addr = the just-committed base, mach region
+         * prot=0 max=7), the load below took EXC_BAD_ACCESS, and that is not a
+         * recoverable fault here:
+         *
+         *   NtAllocateVirtualMemory holds virtual_mutex across this call
+         *   -> the Mach message goes to wine-x18-exc
+         *   -> the delivery path locks virtual_mutex (virtual_handle_fault,
+         *      virtual_setup_exception, the [fault-rgn] dumper)
+         *   -> that lock is held by the very thread whose fault it is servicing.
+         *
+         * Both threads stop forever (t86:6711 "Core_5 - Thread 0" parked at
+         * ios_verify_commit_zero+0x80 run=3 cpu=0, t86:6607 wine-x18-exc in
+         * __psynch_mutexwait on 0x1061a7078 = virtual_mutex), and every later
+         * VirtualAlloc/VirtualProtect/VirtualFree/page-fault fixup in the whole
+         * process queues behind them: the process sits at ~0 % CPU with nothing
+         * in a server wait, which is why [srv-stuck] and [waiters] stayed silent.
+         * A DIAGNOSTIC MUST NOT BE ABLE TO DO THAT.
+         *
+         * mach_vm_read_overwrite reads the same bytes without a load on this
+         * thread: an inaccessible page comes back as a failed kern_return
+         * instead of a fault. And a refused read is itself the signal we most
+         * want — it means a MEM_COMMIT that returned STATUS_SUCCESS left memory
+         * the guest cannot touch — so report it instead of swallowing it. */
+        if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)base,
+                                    (mach_vm_size_t)chk, (mach_vm_address_t)(uintptr_t)snap,
+                                    &got ) != KERN_SUCCESS || got != (mach_vm_size_t)chk)
+        {
+            BYTE hv = get_host_page_vprot( base );
+            mach_vm_address_t ra = (mach_vm_address_t)(uintptr_t)base;
+            mach_vm_size_t rs = 0;
+            vm_region_basic_info_data_64_t ri;
+            mach_msg_type_number_t rc = VM_REGION_BASIC_INFO_COUNT_64;
+            mach_port_t ro = MACH_PORT_NULL;
+            int have_region = (mach_vm_region( mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64,
+                                               (vm_region_info_t)&ri, &rc, &ro ) == KERN_SUCCESS);
+
+            if (hi) stale_hi++; else stale_lo++;
+            dprintf( 2, "[commit-noaccess] #%lu %s *** COMMIT SUCCEEDED BUT PAGE IS UNREADABLE *** "
+                     "base=%p size=0x%lx protect=0x%x host_page_vprot=0x%02x unix_prot=0x%x "
+                     "region=0x%llx+0x%llx prot=%d max=%d checked=%lu/%lu stale=%lu/%lu "
+                     "recommit=%lu rev=ml981\n",
+                     seq, hi ? "arena/pool" : "GUEST", base, (unsigned long)size,
+                     (unsigned)protect, hv, (unsigned)get_unix_prot( hv ),
+                     have_region ? (unsigned long long)ra : 0ull,
+                     have_region ? (unsigned long long)rs : 0ull,
+                     have_region ? ri.protection : -1, have_region ? ri.max_protection : -1,
+                     ck_lo, ck_hi, stale_lo, stale_hi, recommit_n );
+            return;
+        }
+        nz = ios_first_nonzero( snap, chk );
         if (nz < 0)
         {
             /* boring: first few, then sparse -- but the totals ride along */
@@ -13179,7 +13513,7 @@ static void ios_verify_commit_zero( const void *base, SIZE_T size, ULONG protect
             /* ml546 defect #2: ml545 printed bytes[0..7] from BASE while reporting
              * first_nonzero=+0x8 -- so it printed eight zeros and told us nothing
              * about the actual stale content. Print from the offending offset. */
-            const unsigned char *b = (const unsigned char *)base + nz;
+            const unsigned char *b = snap + nz;      /* ml981: the Mach snapshot, same bytes */
             if (hi) stale_hi++; else stale_lo++;      /* ALWAYS logged: this is the signal */
             dprintf( 2, "[commit-zero] #%lu %s *** STALE ON COMMIT *** base=%p size=0x%lx "
                      "protect=0x%x first_nonzero=+0x%lx checked=%lu/%lu stale=%lu/%lu recommit=%lu "
@@ -13664,6 +13998,11 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
             unsigned int skips0 = ios_va_scan_skips;
 
             ptr = map_free_area( start, end, host_size, top_down, unix_prot, align_mask );
+#ifdef WINE_IOS
+            /* the holdback is now a reserved area: place the view there */
+            if (!ptr && ios_cage_release_on_exhaustion( start, end, view_size ))
+                ptr = map_reserved_area( start, end, host_size, top_down, unix_prot, align_mask );
+#endif
             /* [va-scan] the ml116/ml117 probe: a healthy scan costs a handful of
              * tryfixed calls. Hundreds means we are grinding unmappable VA;
              * ptr==NULL is the silent STATUS_NO_MEMORY that handed rpmalloc a
@@ -14230,7 +14569,7 @@ static void ios_dc_census_take( const void *addr, size_t len, struct ios_dc_cens
  * edges -- stays exactly as before. Opt-in; absent env => no-op.
  * Extent bookkeeping runs under virtual_mutex like the callers. */
 #include <fcntl.h>
-/* swap-tier core begin (build/host-tests/check-swap-coverage.py compiles the code up to "core end") */
+/* swap-tier core begin (tests/host/check-swap-coverage.py compiles the code up to "core end") */
 static int      ios_swap_fd = -1;
 static uint64_t ios_swap_cap, ios_swap_bump;
 static struct { char *va; size_t len; uint64_t off; } ios_swap_ext[16384];
@@ -15607,6 +15946,33 @@ static IMAGE_BASE_RELOCATION *process_relocation_block( char *page, IMAGE_BASE_R
 }
 
 
+/* A shared writable image section that is not aligned to the host page is mapped private.
+ *
+ * A section marked IMAGE_SCN_MEM_SHARED | IMAGE_SCN_MEM_WRITE is file-mapped
+ * MAP_SHARED from the server's shared-section file, so every process that maps
+ * the image sees the same bytes.  mmap works in host pages (16 KB here) and PE
+ * sections are aligned to 4 KB: a shared section that does not start and end on
+ * a host page cannot be file-mapped without replacing its neighbours' bytes, so
+ * map_file_into_view refuses it ("unaligned shared mapping"), the image load
+ * failed with STATUS_INVALID_IMAGE_FORMAT and the program never started.  Such
+ * a section is now loaded like any other writable section, from the image file:
+ * its contents are right, but writes are not seen by other processes that map
+ * the same image.  One log line names each section this happens to.
+ */
+static int ios_shared_section_private(void)
+{
+    static int enabled = -1;
+
+    if (enabled < 0)
+    {
+        /* 0 fails the load of an image whose shared writable section is not aligned to the
+         * host page, as before; otherwise that section is mapped private. */
+        const char *e = getenv( "MADEIRA_SHARED_SECTION_PRIVATE" );
+        enabled = !(e && e[0] == '0');
+    }
+    return enabled;
+}
+
 /***********************************************************************
  *           map_image_into_view
  *
@@ -15765,10 +16131,27 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
                             debugstr_us(nt_name), sec[i].Name, ptr + sec[i].VirtualAddress,
                             sec[i].PointerToRawData, (int)pos, file_size, map_size,
                             sec[i].Characteristics );
-            if (map_file_into_view( view, shared_fd, sec[i].VirtualAddress, map_size, pos,
-                                    VPROT_COMMITTED | VPROT_READ | VPROT_WRITE, FALSE ) != STATUS_SUCCESS)
+            NTSTATUS shared_status = map_file_into_view( view, shared_fd, sec[i].VirtualAddress, map_size, pos,
+                                                         VPROT_COMMITTED | VPROT_READ | VPROT_WRITE, FALSE );
+
+            if (shared_status == STATUS_INVALID_PARAMETER && ios_shared_section_private())
+            {
+                /* not host-page aligned: see ios_shared_section_private */
+                dprintf( 2, "[shared-section] %s section %.8s rva=0x%x size=0x%lx is not aligned to the "
+                            "0x%lx-byte host page: mapped private, its writes are not shared between "
+                            "processes (MADEIRA_SHARED_SECTION_PRIVATE=0 fails the load instead)\n",
+                         debugstr_us(nt_name), sec[i].Name, (unsigned)sec[i].VirtualAddress,
+                         (unsigned long)map_size, (unsigned long)host_page_size );
+                pos += map_size;
+                goto private_section;
+            }
+            if (shared_status != STATUS_SUCCESS)
             {
                 ERR_(module)( "Could not map %s shared section %.8s\n", debugstr_us(nt_name), sec[i].Name );
+                dprintf( 2, "[shared-section] %s section %.8s rva=0x%x size=0x%lx: shared mapping failed, "
+                            "status=0x%x shared_fd=%d\n", debugstr_us(nt_name), sec[i].Name,
+                         (unsigned)sec[i].VirtualAddress, (unsigned long)map_size,
+                         (unsigned)shared_status, shared_fd );
                 do { IOS_IMG_FAIL(8); goto done; } while (0);
             }
 
@@ -15788,6 +16171,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
             continue;
         }
 
+    private_section:
         TRACE_(module)( "mapping %s section %.8s at %p off %x size %x virt %x flags %x\n",
                         debugstr_us(nt_name), sec[i].Name, ptr + sec[i].VirtualAddress,
                         sec[i].PointerToRawData, sec[i].SizeOfRawData,
@@ -16175,7 +16559,10 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
 
     if (base)
     {
+        /* see ios_exe_win_stripped_request */
+        ios_exe_win_stripped_request = (image_info->image_charact & IMAGE_FILE_RELOCS_STRIPPED) != 0;
         status = map_view( view_ret, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
+        ios_exe_win_stripped_request = 0;
         /* ml988: commit or roll back a pending fixed-base claim. No-ops unless
          * ios_exe_win_claim granted this exact interval during the call above. */
         ios_exe_win_commit_claim( base, size, !status );
@@ -16584,9 +16971,18 @@ static void *alloc_virtual_heap( SIZE_T size )
 }
 
 /* is_wow64() also asks the calling thread's TEB (wine unix_private.h), so a
- * 64-bit thread in a session that has a 32-bit process keeps its 64-bit
- * answer.  MADEIRA_WOW64_BY_TEB=0 restores the session-global answer. */
+ * thread that carries a 32-bit TEB is WoW64 whatever the global says.  A
+ * 64-bit thread has no 32-bit TEB and still gets the session-global
+ * !!wow_peb, which is TRUE in every process once any 32-bit pseudo-process
+ * has booted.  MADEIRA_WOW64_BY_TEB=0 restores the session-global answer. */
 int ios_wow64_by_teb = 1;
+
+/* get_extended_params(): a MEM_ADDRESS_REQUIREMENTS ceiling is a guest (WoW)
+ * ceiling only in a process that owns a guest window.  Every other process
+ * validates against the host ceiling, even after a 32-bit pseudo-process has
+ * set the session-wide wow_peb.  MADEIRA_WOW_LIMIT_BY_WINDOW=0 restores the
+ * session-wide is_wow64() fallback. */
+static int ios_wow_limit_by_window = 1;
 
 /***********************************************************************
  *           virtual_init
@@ -16741,6 +17137,8 @@ void virtual_init(void)
     {
         const char *e = getenv( "MADEIRA_WOW64_BY_TEB" );
         if (e && e[0] == '0') ios_wow64_by_teb = 0;
+        e = getenv( "MADEIRA_WOW_LIMIT_BY_WINDOW" );
+        if (e && e[0] == '0') ios_wow_limit_by_window = 0;
     }
 }
 
@@ -17921,6 +18319,26 @@ void virtual_map_user_shared_data(void)
     }
     if (needs_close) close( fd );
     NtClose( section );
+
+    /* ml1001: SAY WHAT THE GUEST CLOCK READS, ONCE, AT THE MOMENT IT BECOMES
+     * READABLE.  GetTickCount()/GetTickCount64() in kernelbase are three loads
+     * from this page and nothing else, so this line IS what every guest program
+     * will be told the time is.  It read 0 for the entire life of this port
+     * (the server's publication was opt-in behind MADEIRA_USD_TIME), which is
+     * indistinguishable in a log from "nobody asked" -- so print it rather than
+     * infer it.  A zero here means the clock is frozen and any guest that keys
+     * a data structure on the tick will collide every entry against every
+     * other one.  Two reads, once per process. */
+    {
+        unsigned long long ms = ((unsigned long long)user_shared_data->TickCount.High1Time << 32)
+                                | user_shared_data->TickCount.LowPart;
+        dprintf( 2, "[usd-clock] ml1001 guest KUSER_SHARED_DATA at %p: GetTickCount64()=%llu ms "
+                    "(TickCountMultiplier=0x%x) — %s\n",
+                 (void *)user_shared_data, ms,
+                 (unsigned)user_shared_data->TickCountMultiplier,
+                 ms ? "ticking" : "*** FROZEN AT ZERO: every guest tick-keyed timer will collide "
+                                  "(MADEIRA_USD_TIME=0 set?) ***" );
+    }
 }
 
 
@@ -19136,6 +19554,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     /* Reserve the memory */
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    ios_alloc_ec_code = (attributes & MEM_EXTENDED_PARAMETER_EC_CODE) != 0;   /* see ios_guest_anon_rwx_is_host_data */
 
     if ((type & MEM_RESERVE) || !base)
     {
@@ -19281,6 +19700,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
 
+    ios_alloc_ec_code = 0;
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
 
     if (status == STATUS_SUCCESS)
@@ -19351,9 +19771,24 @@ static void ios_vm_note_alloc( void *base, SIZE_T size, ULONG type, ULONG protec
      * which printed only the RESULT. Always log a violating or low-limited
      * request, regardless of the census budget. */
     int viol = (lim && b > lim);
+    /* Bounded. A WoW64 process lives in its own 4 GB window, so every one of its
+     * allocations carries zero_bits and lands "above" its 32-bit limit by design;
+     * the uncapped branch below logged each of them: 127,000 lines (22 MB of a
+     * 25 MB device log) in one 32-bit session, 3.5 million lines (562 MB) in a
+     * longer one. WoW64 is skipped except for the watch address, and the
+     * always-log branch is capped at 200. MADEIRA_VALLOC_LOG_ALL=1 restores the
+     * old reach. */
+    static int log_all = -1;
+    static unsigned long special_logged;
+    int special = viol || zbits;
+    if (log_all < 0) { const char *e = getenv( "MADEIRA_VALLOC_LOG_ALL" ); log_all = e && e[0] == '1'; }
+    if (!log_all && !covers && is_wow64()) return;
     if (b < 0x100000000ull && !viol && !zbits) return;
-    if (covers || viol || zbits || ios_vm_alloc_logged < 3000)
+    if (covers || (special && (log_all || special_logged < 200)) || (!special && ios_vm_alloc_logged < 3000))
     {
+        if (special && !covers && ++special_logged == 200)
+            dprintf( 2, "[valloc] limited/violating allocations: first 200 logged, the rest are not "
+                        "(MADEIRA_VALLOC_LOG_ALL=1 logs all)\n" );
         ios_vm_alloc_logged++;
         dprintf( 2, "[valloc] ml959 %s base=0x%llx size=0x%llx type=0x%x prot=0x%x tid=%04x"
                  " | req_hint=0x%llx zero_bits=0x%llx limit=0x%llx%s\n",
@@ -20895,12 +21330,35 @@ static NTSTATUS get_extended_params( const MEM_EXTENDED_PARAMETER *parameters, U
              * constraint only when its ceiling is below 4 GB (32-bit code
              * cannot name anything higher).  The CPU module's own allocators
              * in the same process pass explicit HIGH host bands and must be
-             * validated against the host ceiling.  Without a window this is
-             * the upstream rule. */
+             * validated against the host ceiling.
+             *
+             * A process WITHOUT a window of its own is a 64-bit process, and
+             * must not fall back to is_wow64(): for a 64-bit thread that reads
+             * the session-wide wow_peb, which every pseudo-process sees set
+             * once any 32-bit program has booted.  The 64-bit process then had
+             * its host band requests (the CPU module's per-thread lookup
+             * cache at 0x7c00000000+) rejected with STATUS_INVALID_PARAMETER
+             * against the 2/4 GB guest ceiling, before any placement ran. */
             if (ios_wow_base())
                 limit = ((ULONG_PTR)r->HighestEndingAddress &&
                          (ULONG_PTR)r->HighestEndingAddress < IOS_WOW_WINDOW_SIZE)
                         ? get_wow_user_space_limit() : (ULONG_PTR)user_space_limit;
+            else if (ios_wow_limit_by_window)
+            {
+                limit = (ULONG_PTR)user_space_limit;
+                if (is_wow64())
+                {
+                    static int no_window_n;
+
+                    if (no_window_n++ < 4)
+                        dprintf( 2, "[wow-hostreq] range [%p,%p] from a process without a guest "
+                                    "window while the session has a 32-bit process: validated "
+                                    "against the host ceiling %p, not the guest ceiling %p "
+                                    "(MADEIRA_WOW_LIMIT_BY_WINDOW=0 reverts)\n",
+                                 r->LowestStartingAddress, r->HighestEndingAddress,
+                                 (void *)limit, (void *)get_wow_user_space_limit() );
+                }
+            }
             else
 #endif
             if (is_wow64()) limit = get_wow_user_space_limit();
