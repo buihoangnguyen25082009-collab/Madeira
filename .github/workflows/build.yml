@@ -23,15 +23,24 @@ jobs:
         with:
           xcode-version: '15.4'
 
-      - name: Patch Signing Scripts
+      - name: Patch Frameworks & Signing
         run: |
           # 1. Khoi phuc tat ca file .swiftinterface ve trang thai goc
           git checkout -- '*.swiftinterface' 2>/dev/null || true
 
-          # 2. Vo hieu hoa moi script codesign trong file bash/python
+          # 2. Chi sua rieng cac module cua Apple ve cu phap Swift chuan (giu nguyen StikJIT::)
+          find . -name "*.swiftinterface" -exec sed -i '' \
+            -e 's/Swift::/Swift./g' \
+            -e 's/Foundation::/Foundation./g' \
+            -e 's/Darwin::/Darwin./g' \
+            -e 's/Dispatch::/Dispatch./g' \
+            -e 's/ObjectiveC::/ObjectiveC./g' \
+            -e 's/_Concurrency::/_Concurrency./g' {} + || true
+
+          # 3. Vo hieu hoa moi script codesign trong file bash/python
           find . -type f \( -name "*.sh" -o -name "*.py" \) -exec sed -i '' 's/codesign/true/g' {} + || true
 
-          # 3. Vo hieu hoa Run Script Sign bundled dylibs trong project.pbxproj
+          # 4. Vo hieu hoa Run Script Sign bundled dylibs trong project.pbxproj
           python3 -c '
           import glob, re
 
@@ -68,12 +77,11 @@ jobs:
             -destination 'generic/platform=iOS' \
             -configuration Release \
             SWIFT_CXX_INTEROPERABILITY_MODE=default \
-            OTHER_SWIFT_FLAGS="-cxx-interoperability-mode=default" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             -derivedDataPath build_output \
-            clean build 2>&1 | tee xcodebuild.log || {
+            build 2>&1 | tee xcodebuild.log || {
               echo "==================== XCODE ERROR DETAILS ===================="
               grep -E -i -C 2 "error:|fatal error:|PhaseScriptExecution.*failed" xcodebuild.log | tail -n 40
               echo "============================================================="
