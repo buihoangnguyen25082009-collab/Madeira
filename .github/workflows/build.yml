@@ -23,18 +23,15 @@ jobs:
         with:
           xcode-version: '15.4'
 
-      - name: Patch Frameworks & Signing
+      - name: Patch Signing Scripts
         run: |
-          # 1. Thay the toan bo dau :: thanh dau . trong tat ca file .swiftinterface
-          find . -name "*.swiftinterface" -exec sed -i '' 's/::/./g' {} + || true
+          # 1. Khoi phuc tat ca file .swiftinterface ve trang thai goc
+          git checkout -- '*.swiftinterface' 2>/dev/null || true
 
-          # 2. Chuyen StikJITError thanh struct hop le
-          find . -name "*.swiftinterface" -exec sed -i '' 's/public enum StikJITError/public struct StikJITError/g' {} + || true
-
-          # 3. Vo hieu hoa moi script codesign trong file bash/python
+          # 2. Vo hieu hoa moi script codesign trong file bash/python
           find . -type f \( -name "*.sh" -o -name "*.py" \) -exec sed -i '' 's/codesign/true/g' {} + || true
 
-          # 4. Vo hieu hoa Run Script Sign bundled dylibs trong project.pbxproj
+          # 3. Vo hieu hoa Run Script Sign bundled dylibs trong project.pbxproj
           python3 -c '
           import glob, re
 
@@ -70,11 +67,13 @@ jobs:
             -scheme "$SCHEME" \
             -destination 'generic/platform=iOS' \
             -configuration Release \
+            SWIFT_CXX_INTEROPERABILITY_MODE=default \
+            OTHER_SWIFT_FLAGS="-cxx-interoperability-mode=default" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             -derivedDataPath build_output \
-            build 2>&1 | tee xcodebuild.log || {
+            clean build 2>&1 | tee xcodebuild.log || {
               echo "==================== XCODE ERROR DETAILS ===================="
               grep -E -i -C 2 "error:|fatal error:|PhaseScriptExecution.*failed" xcodebuild.log | tail -n 40
               echo "============================================================="
