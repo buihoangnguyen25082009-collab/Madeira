@@ -25,13 +25,16 @@ jobs:
 
       - name: Patch Frameworks & Signing
         run: |
-          # 1. Va loi StikJIT swiftinterface: chuyen enum khong case thanh struct de Swift khong chan
+          # 1. Thay the toan bo dau :: thanh dau . trong tat ca file .swiftinterface
+          find . -name "*.swiftinterface" -exec sed -i '' 's/::/./g' {} + || true
+
+          # 2. Chuyen StikJITError thanh struct hop le
           find . -name "*.swiftinterface" -exec sed -i '' 's/public enum StikJITError/public struct StikJITError/g' {} + || true
 
-          # 2. Vo hieu hoa moi script codesign trong file bash/python
+          # 3. Vo hieu hoa moi script codesign trong file bash/python
           find . -type f \( -name "*.sh" -o -name "*.py" \) -exec sed -i '' 's/codesign/true/g' {} + || true
 
-          # 3. Vo hieu hoa Run Script Sign bundled dylibs trong project.pbxproj
+          # 4. Vo hieu hoa Run Script Sign bundled dylibs trong project.pbxproj
           python3 -c '
           import glob, re
 
