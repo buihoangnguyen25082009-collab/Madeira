@@ -22,25 +22,27 @@ jobs:
         with:
           xcode-version: latest-stable
 
-      - name: Disable dylib signing script
+      - name: Patch out dylib signing
         run: |
+          # 1. Vo hieu hoa codesign trong tat ca file script .sh va .py
+          find . -type f \( -name "*.sh" -o -name "*.py" \) -exec sed -i '' 's/codesign/true/g' {} + || true
+
+          # 2. Thay the truc tiep moi lenh codesign trong file cau hinh Xcode
           python3 -c '
-          import re, glob
+          import glob, re
 
           for pbx in glob.glob("**/*.pbxproj", recursive=True):
               with open(pbx, "r", encoding="utf-8") as f:
                   content = f.read()
 
-              def patch_block(match):
-                  block = match.group(0)
-                  if "Sign bundled dylibs" in block:
-                      print(f"Patched Sign bundled dylibs in {pbx}")
-                      block = re.sub(r"shellScript = \"[\s\S]*?\";", "shellScript = \"exit 0\\n\";", block)
-                  return block
+              # Thay the moi cu phap codesign thanh /usr/bin/true
+              content = content.replace("/usr/bin/codesign", "/usr/bin/true")
+              content = content.replace("codesign ", "/usr/bin/true ")
+              content = content.replace("\"codesign\"", "\"/usr/bin/true\"")
 
-              new_content = re.sub(r"\{[^{}]*isa = PBXShellScriptBuildPhase;[^{}]*\}", patch_block, content)
               with open(pbx, "w", encoding="utf-8") as f:
-                  f.write(new_content)
+                  f.write(content)
+              print(f"Patched {pbx}")
           '
 
       - name: Build Project
